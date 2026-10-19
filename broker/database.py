@@ -1,5 +1,6 @@
 
 import hashlib
+import math
 import secrets
 import sqlite3
 import time
@@ -31,8 +32,8 @@ def issue_lease(task_id, action, resource, ttl_seconds=60, db_path=DEFAULT_DB):
     """Create a random lease token and store only its hash."""
     if not task_id or not action or not resource:
         raise ValueError("task_id, action, and resource are required")
-    if ttl_seconds <= 0:
-        raise ValueError("ttl_seconds must be positive")
+    if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+        raise ValueError("ttl_seconds must be positive and finite")
 
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
