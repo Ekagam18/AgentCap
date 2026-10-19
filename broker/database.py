@@ -77,3 +77,4 @@ def consume_lease(token, db_path=DEFAULT_DB):
         ).fetchone()
 
         return dict(row) if row else None
+
