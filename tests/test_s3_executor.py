@@ -873,3 +873,129 @@ def test_default_boto3_client_resolution():
 
         mock_boto_client.assert_called_once_with("s3")
         assert result.content_bytes == b"resolved-via-boto3"
+
+
+# ---------------------------------------------------------------------------
+# 10. Additional defensive edge cases & error sanitization
+# ---------------------------------------------------------------------------
+
+def test_unexpected_generic_exception_sanitized():
+    """Ensure non-boto unexpected exceptions are sanitized without leaking sensitive messages."""
+    mock_client = MagicMock()
+    mock_client.get_object.side_effect = ConnectionResetError(
+        "Connection reset by peer at internal-host.corp:8443 with token=SECRET_TOKEN_999"
+    )
+
+    lease = make_valid_lease()
+    with pytest.raises(S3ServiceError) as exc_info:
+        execute_consumed_lease(
+            lease,
+            ALLOWED_BUCKET,
+            ALLOWED_PREFIX,
+            s3_client=mock_client,
+        )
+
+    err_msg = str(exc_info.value)
+    assert "Unexpected error (ConnectionResetError) during S3 GetObject" in err_msg
+    assert "SECRET_TOKEN_999" not in err_msg
+    assert "internal-host.corp" not in err_msg
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize("invalid_response", ["not-a-dict", 12345, None, [1, 2, 3]])
+def test_non_dict_s3_response_rejected(invalid_response):
+    """Reject responses from S3 client that are not dictionaries."""
+    mock_client = MagicMock()
+    mock_client.get_object.return_value = invalid_response
+
+    lease = make_valid_lease()
+    with pytest.raises(S3ServiceError, match="Invalid response format received from S3 client"):
+        execute_consumed_lease(
+            lease,
+            ALLOWED_BUCKET,
+            ALLOWED_PREFIX,
+            s3_client=mock_client,
+        )
+
+
+@pytest.mark.parametrize("unreadable_body", [123, object(), "string-not-bytes"])
+def test_unreadable_body_rejected(unreadable_body):
+    """Reject responses whose Body does not have a callable read method and is not bytes."""
+    mock_client = MagicMock()
+    mock_client.get_object.return_value = {
+        "Body": unreadable_body,
+        "ContentLength": 10,
+    }
+
+    lease = make_valid_lease()
+    with pytest.raises(S3ExecutorError, match="Response body is not readable"):
+        execute_consumed_lease(
+            lease,
+            ALLOWED_BUCKET,
+            ALLOWED_PREFIX,
+            s3_client=mock_client,
+        )
+
+
+def test_non_bytes_stream_chunk_rejected():
+    """Reject stream reading if the body's read() method returns non-bytes data."""
+    mock_body = MagicMock()
+    # Returns a string instead of bytes
+    mock_body.read.return_value = "non-bytes-text-chunk"
+    mock_client = MagicMock()
+    mock_client.get_object.return_value = {
+        "Body": mock_body,
+        "ContentLength": 20,
+    }
+
+    lease = make_valid_lease()
+    with pytest.raises(S3ExecutorError, match="Unexpected non-bytes data read from response body"):
+        execute_consumed_lease(
+            lease,
+            ALLOWED_BUCKET,
+            ALLOWED_PREFIX,
+            s3_client=mock_client,
+        )
+    mock_body.close.assert_called_once()
+
+
+def test_raw_bytes_and_bytearray_body():
+    """Verify that in-memory bytes or bytearray bodies are handled and size-enforced."""
+    mock_client = MagicMock()
+
+    # Successful bytes read
+    mock_client.get_object.return_value = {"Body": b"raw-bytes-payload", "ContentLength": 17}
+    res_bytes = execute_consumed_lease(make_valid_lease(), ALLOWED_BUCKET, ALLOWED_PREFIX, s3_client=mock_client)
+    assert res_bytes.content_bytes == b"raw-bytes-payload"
+
+    # Successful bytearray read
+    mock_client.get_object.return_value = {"Body": bytearray(b"bytearray-payload"), "ContentLength": 17}
+    res_bytearray = execute_consumed_lease(make_valid_lease(), ALLOWED_BUCKET, ALLOWED_PREFIX, s3_client=mock_client)
+    assert res_bytearray.content_bytes == b"bytearray-payload"
+
+    # Oversized bytes
+    mock_client.get_object.return_value = {"Body": b"X" * 150}
+    with pytest.raises(S3ObjectTooLargeError, match="exceeds maximum allowed size"):
+        execute_consumed_lease(make_valid_lease(), ALLOWED_BUCKET, ALLOWED_PREFIX, s3_client=mock_client, max_object_bytes=100)
+
+
+def test_malformed_content_length_header_falls_through_to_stream_check():
+    """Ensure malformed/non-integer ContentLength headers fall through and stream size is still enforced."""
+    stream_data = b"T" * 150
+    mock_body = MockStreamingBody(stream_data)
+    mock_client = MagicMock()
+    mock_client.get_object.return_value = {
+        "Body": mock_body,
+        "ContentLength": "not-an-integer",
+    }
+
+    lease = make_valid_lease()
+    with pytest.raises(S3ObjectTooLargeError, match="Object byte stream exceeded maximum allowed size"):
+        execute_consumed_lease(
+            lease,
+            ALLOWED_BUCKET,
+            ALLOWED_PREFIX,
+            s3_client=mock_client,
+            max_object_bytes=100,
+        )
+    assert mock_body.closed is True
