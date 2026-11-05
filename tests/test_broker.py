@@ -1,10 +1,21 @@
 """Integration tests for the AgentCap broker API."""
 
+import base64
+import io
 import sqlite3
+import time
+from unittest.mock import MagicMock
+
 import pytest
+from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 
-from broker.database import connect, consume_lease
+import broker.main
+from broker.database import connect, consume_lease, get_audit_events
+from broker.execution_service import (
+    DEFAULT_MAX_OBJECT_BYTES,
+    execute_lease_token as real_execute_lease_token,
+)
 from broker.main import app
 
 ADMIN_KEY = "test-admin-secret-key-12345"
@@ -14,6 +25,74 @@ ALLOWED_BUCKET = "agentcap-demo"
 ALLOWED_PREFIX = "reports/"
 VALID_RESOURCE = "s3://agentcap-demo/reports/q3-report.txt"
 VALID_ACTION = "s3:GetObject"
+
+
+class MockStreamingBody:
+    """Mock for botocore.response.StreamingBody supporting chunked reads and close tracking."""
+
+    def __init__(self, data: bytes):
+        self._bio = io.BytesIO(data)
+        self.closed = False
+
+    def read(self, amt: int | None = None) -> bytes:
+        return self._bio.read(amt)
+
+    def close(self) -> None:
+        self.closed = True
+        self._bio.close()
+
+
+def make_mock_s3_client(
+    payload: bytes = b"Report content",
+    content_type: str = "text/plain",
+    etag: str = '"etag-12345"',
+) -> tuple[MagicMock, MockStreamingBody]:
+    """Helper to create a mocked S3 client returning predefined payload and metadata."""
+    mock_body = MockStreamingBody(payload)
+    mock_client = MagicMock()
+    mock_client.get_object.return_value = {
+        "Body": mock_body,
+        "ContentLength": len(payload),
+        "ContentType": content_type,
+        "ETag": etag,
+        "VersionId": "v1",
+        "LastModified": "2026-11-05T00:00:00Z",
+        "Metadata": {},
+    }
+    return mock_client, mock_body
+
+
+def mock_s3_for_broker(monkeypatch, mock_client):
+    """Wrap broker.main.execute_lease_token to inject mock_client and mock boto3."""
+    def wrapper(
+        token,
+        allowed_bucket,
+        allowed_prefix,
+        db_path=None,
+        s3_client=None,
+        max_object_bytes=DEFAULT_MAX_OBJECT_BYTES,
+        **kwargs,
+    ):
+        return real_execute_lease_token(
+            token,
+            allowed_bucket,
+            allowed_prefix,
+            db_path=db_path,
+            s3_client=mock_client if s3_client is None else s3_client,
+            max_object_bytes=max_object_bytes,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(broker.main, "execute_lease_token", wrapper)
+    monkeypatch.setattr("broker.s3_executor.boto3.client", lambda *args, **kwargs: mock_client)
+
+
+@pytest.fixture
+def mock_s3(monkeypatch):
+    """Fixture providing a mock S3 client attached to the broker."""
+    mock_client, mock_body = make_mock_s3_client()
+    mock_s3_for_broker(monkeypatch, mock_client)
+    return mock_client, mock_body
 
 
 @pytest.fixture
@@ -303,3 +382,492 @@ def test_fail_safely_when_configuration_missing(client_env, monkeypatch):
         headers={"X-Agent-Key": "some-key"},
     )
     assert agent_res.status_code == 500
+
+
+# ==============================================================================
+# Phase 2: POST /leases/execute Integration Tests
+# ==============================================================================
+
+
+def test_execute_lease_endpoint_success(client_env, mock_s3):
+    client, db_file = client_env
+    mock_client, mock_body = mock_s3
+
+    # 1. Admin registers task
+    task_res = _register_task(client)
+    assert task_res.status_code == 201
+    task_id = task_res.json()["task_id"]
+
+    # 2. Agent requests single-use lease
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert lease_res.status_code == 201
+    token = lease_res.json()["lease_token"]
+
+    # 3. Agent executes lease
+    exec_res = client.post(
+        "/leases/execute",
+        json={"lease_token": token},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert exec_res.status_code == 200
+    data = exec_res.json()
+
+    # Verify response body structure
+    expected_bytes = b"Report content"
+    assert data["content_base64"] == base64.b64encode(expected_bytes).decode("ascii")
+    assert base64.b64decode(data["content_base64"]) == expected_bytes
+    assert data["content_length"] == len(expected_bytes)
+    assert data["content_type"] == "text/plain"
+    assert data["etag"] == "etag-12345"
+    assert "lease_token" not in data
+
+    # Verify S3 client was called properly
+    mock_client.get_object.assert_called_once_with(
+        Bucket=ALLOWED_BUCKET,
+        Key="reports/q3-report.txt",
+    )
+    assert mock_body.closed is True
+
+    # Verify DB lease status is now 'consumed'
+    with connect(db_file) as conn:
+        row = conn.execute("SELECT status FROM leases WHERE task_id = ?", (task_id,)).fetchone()
+        assert row["status"] == "consumed"
+
+    # Verify audit events recorded (both lease_issued and s3_execution_succeeded)
+    events = get_audit_events(db_path=db_file)
+    exec_events = [e for e in events if e["event_type"] == "s3_execution_succeeded"]
+    assert len(exec_events) == 1
+    assert exec_events[0]["outcome"] == "success"
+    assert exec_events[0]["task_id"] == task_id
+    assert exec_events[0]["action"] == VALID_ACTION
+    assert exec_events[0]["resource"] == VALID_RESOURCE
+
+
+def test_execute_lease_endpoint_auth_failures(client_env, mock_s3):
+    client, _ = client_env
+    mock_client, _ = mock_s3
+
+    # Missing X-Agent-Key header
+    res_no_key = client.post(
+        "/leases/execute",
+        json={"lease_token": "some-token"},
+    )
+    assert res_no_key.status_code == 401
+
+    # Invalid X-Agent-Key header
+    res_bad_key = client.post(
+        "/leases/execute",
+        json={"lease_token": "some-token"},
+        headers={"X-Agent-Key": "incorrect-secret-key"},
+    )
+    assert res_bad_key.status_code == 401
+
+    # Admin key supplied in X-Admin-Key instead of X-Agent-Key
+    res_admin_header = client.post(
+        "/leases/execute",
+        json={"lease_token": "some-token"},
+        headers={"X-Admin-Key": ADMIN_KEY},
+    )
+    assert res_admin_header.status_code == 401
+
+    # Admin key supplied in X-Agent-Key
+    res_admin_as_agent = client.post(
+        "/leases/execute",
+        json={"lease_token": "some-token"},
+        headers={"X-Agent-Key": ADMIN_KEY},
+    )
+    assert res_admin_as_agent.status_code == 401
+
+    mock_client.get_object.assert_not_called()
+
+
+def test_execute_lease_endpoint_invalid_token(client_env, mock_s3):
+    client, db_file = client_env
+    mock_client, _ = mock_s3
+
+    res = client.post(
+        "/leases/execute",
+        json={"lease_token": "non_existent_fake_token_123456789012345678"},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert res.status_code == 403
+    assert res.json() == {"detail": "Invalid, expired, or already consumed lease token"}
+    mock_client.get_object.assert_not_called()
+
+    # Verify rejection audit event recorded
+    events = get_audit_events(db_path=db_file)
+    assert len(events) == 1
+    assert events[0]["event_type"] == "lease_execution_rejected"
+    assert events[0]["outcome"] == "invalid_token"
+
+
+def test_execute_lease_endpoint_expired_token(client_env, mock_s3):
+    client, db_file = client_env
+    mock_client, _ = mock_s3
+
+    task_res = _register_task(client)
+    task_id = task_res.json()["task_id"]
+
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    token = lease_res.json()["lease_token"]
+
+    # Expire the lease in SQLite
+    with connect(db_file) as conn:
+        conn.execute("UPDATE leases SET expires_at = ?", (int(time.time()) - 30,))
+
+    res = client.post(
+        "/leases/execute",
+        json={"lease_token": token},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert res.status_code == 403
+    assert res.json() == {"detail": "Invalid, expired, or already consumed lease token"}
+    mock_client.get_object.assert_not_called()
+
+    # Verify rejection audit event
+    events = get_audit_events(db_path=db_file)
+    assert events[-1]["event_type"] == "lease_execution_rejected"
+    assert events[-1]["outcome"] == "invalid_token"
+
+
+def test_execute_lease_endpoint_replay_protection(client_env, mock_s3):
+    client, db_file = client_env
+    mock_client, _ = mock_s3
+
+    task_res = _register_task(client)
+    task_id = task_res.json()["task_id"]
+
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    token = lease_res.json()["lease_token"]
+
+    # First execution succeeds
+    res1 = client.post(
+        "/leases/execute",
+        json={"lease_token": token},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert res1.status_code == 200
+    assert mock_client.get_object.call_count == 1
+
+    # Second execution (replay) fails with 403
+    res2 = client.post(
+        "/leases/execute",
+        json={"lease_token": token},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert res2.status_code == 403
+    assert res2.json() == {"detail": "Invalid, expired, or already consumed lease token"}
+
+    # S3 must NOT be called again
+    assert mock_client.get_object.call_count == 1
+
+    # Verify audit trail has lease_execution_rejected
+    events = get_audit_events(db_path=db_file)
+    assert events[-1]["event_type"] == "lease_execution_rejected"
+    assert events[-1]["outcome"] == "invalid_token"
+
+
+def test_execute_lease_endpoint_whitespace_padded_token_rejected_without_consuming(client_env, mock_s3):
+    client, db_file = client_env
+    mock_client, _ = mock_s3
+
+    task_res = _register_task(client)
+    task_id = task_res.json()["task_id"]
+
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    token = lease_res.json()["lease_token"]
+
+    # Whitespace-padded token is rejected with 403
+    padded_res = client.post(
+        "/leases/execute",
+        json={"lease_token": f" {token} "},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert padded_res.status_code == 403
+    assert padded_res.json() == {"detail": "Invalid, expired, or already consumed lease token"}
+    mock_client.get_object.assert_not_called()
+
+    # The lease must still be issued in DB
+    with connect(db_file) as conn:
+        row = conn.execute("SELECT status FROM leases WHERE task_id = ?", (task_id,)).fetchone()
+        assert row["status"] == "issued"
+
+    # Exact token execution succeeds
+    valid_res = client.post(
+        "/leases/execute",
+        json={"lease_token": token},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert valid_res.status_code == 200
+    assert mock_client.get_object.call_count == 1
+
+
+@pytest.mark.parametrize("extra_key", ["action", "resource", "bucket", "key", "agent_id", "extra_field"])
+def test_execute_lease_endpoint_extra_fields_rejected(client_env, mock_s3, extra_key):
+    client, db_file = client_env
+    mock_client, _ = mock_s3
+
+    task_res = _register_task(client)
+    task_id = task_res.json()["task_id"]
+
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    token = lease_res.json()["lease_token"]
+
+    bad_res = client.post(
+        "/leases/execute",
+        json={"lease_token": token, extra_key: "disallowed-value"},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert bad_res.status_code == 422
+    mock_client.get_object.assert_not_called()
+
+    # The lease must still remain issued
+    with connect(db_file) as conn:
+        row = conn.execute("SELECT status FROM leases WHERE task_id = ?", (task_id,)).fetchone()
+        assert row["status"] == "issued"
+
+
+def test_execute_lease_endpoint_empty_and_missing_token_rejected(client_env, mock_s3):
+    client, _ = client_env
+    mock_client, _ = mock_s3
+
+    # Empty string token
+    res_empty = client.post(
+        "/leases/execute",
+        json={"lease_token": ""},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert res_empty.status_code == 422
+
+    # Missing lease_token
+    res_missing = client.post(
+        "/leases/execute",
+        json={},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert res_missing.status_code == 422
+
+    mock_client.get_object.assert_not_called()
+
+
+def test_execute_lease_endpoint_s3_service_error_sanitized(client_env, monkeypatch):
+    client, db_file = client_env
+    mock_client = MagicMock()
+    mock_client.get_object.side_effect = ClientError(
+        {"Error": {"Code": "NoSuchKey", "Message": "Internal secret key path /var/data/private"}},
+        "GetObject",
+    )
+    mock_s3_for_broker(monkeypatch, mock_client)
+
+    task_res = _register_task(client)
+    task_id = task_res.json()["task_id"]
+
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    token = lease_res.json()["lease_token"]
+
+    exec_res = client.post(
+        "/leases/execute",
+        json={"lease_token": token},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert exec_res.status_code == 502
+    assert exec_res.json() == {"detail": "S3 service execution failed"}
+    assert "Internal secret key" not in exec_res.text
+    assert "NoSuchKey" not in exec_res.text
+
+    # Verify lease is consumed in DB
+    with connect(db_file) as conn:
+        row = conn.execute("SELECT status FROM leases WHERE task_id = ?", (task_id,)).fetchone()
+        assert row["status"] == "consumed"
+
+    # Verify failure audit event recorded
+    events = get_audit_events(db_path=db_file)
+    assert events[-1]["event_type"] == "s3_execution_failed"
+    assert events[-1]["outcome"] == "S3ServiceError"
+
+    # Replay cannot be attempted
+    replay_res = client.post(
+        "/leases/execute",
+        json={"lease_token": token},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert replay_res.status_code == 403
+
+
+def test_execute_lease_endpoint_oversized_object(client_env, monkeypatch):
+    client, db_file = client_env
+    mock_client = MagicMock()
+    # ContentLength exceeding 1 MiB limit
+    mock_client.get_object.return_value = {
+        "Body": MockStreamingBody(b"payload"),
+        "ContentLength": 2 * 1024 * 1024,
+        "ContentType": "text/plain",
+        "ETag": '"etag-oversized"',
+    }
+    mock_s3_for_broker(monkeypatch, mock_client)
+
+    task_res = _register_task(client)
+    task_id = task_res.json()["task_id"]
+
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    token = lease_res.json()["lease_token"]
+
+    exec_res = client.post(
+        "/leases/execute",
+        json={"lease_token": token},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert exec_res.status_code == 413
+    assert exec_res.json() == {"detail": "Object size exceeds maximum allowed limit"}
+
+    # Lease is consumed
+    with connect(db_file) as conn:
+        row = conn.execute("SELECT status FROM leases WHERE task_id = ?", (task_id,)).fetchone()
+        assert row["status"] == "consumed"
+
+    # Audit event recorded
+    events = get_audit_events(db_path=db_file)
+    assert events[-1]["event_type"] == "s3_execution_failed"
+    assert events[-1]["outcome"] == "S3ObjectTooLargeError"
+
+
+def test_execute_lease_endpoint_audit_failure_fails_closed(client_env, monkeypatch):
+    client, db_file = client_env
+    mock_client, _ = make_mock_s3_client()
+    mock_s3_for_broker(monkeypatch, mock_client)
+
+    task_res = _register_task(client)
+    task_id = task_res.json()["task_id"]
+
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    token = lease_res.json()["lease_token"]
+
+    # Force record_audit_event in broker.execution_service to fail for s3_execution_succeeded
+    from broker import execution_service
+
+    orig_record_audit_event = execution_service.record_audit_event
+
+    def failing_audit_event(**kwargs):
+        if kwargs.get("event_type") == "s3_execution_succeeded":
+            raise sqlite3.OperationalError("simulated database lock")
+        return orig_record_audit_event(**kwargs)
+
+    monkeypatch.setattr(execution_service, "record_audit_event", failing_audit_event)
+
+    exec_res = client.post(
+        "/leases/execute",
+        json={"lease_token": token},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert exec_res.status_code == 503
+    assert exec_res.json() == {"detail": "Execution audit logging failed"}
+    assert "simulated database lock" not in exec_res.text
+
+
+def test_execute_lease_endpoint_policy_violation(client_env, mock_s3):
+    client, db_file = client_env
+    mock_client, _ = mock_s3
+
+    task_res = _register_task(client)
+    task_id = task_res.json()["task_id"]
+
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    token = lease_res.json()["lease_token"]
+
+    # Tamper with the issued lease in SQLite so its resource violates prefix policy
+    with connect(db_file) as conn:
+        conn.execute(
+            "UPDATE leases SET resource = ? WHERE task_id = ?",
+            ("s3://agentcap-demo/forbidden/secret.txt", task_id),
+        )
+
+    exec_res = client.post(
+        "/leases/execute",
+        json={"lease_token": token},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert exec_res.status_code == 403
+    assert exec_res.json() == {"detail": "Access denied: policy violation"}
+    mock_client.get_object.assert_not_called()
+
+
+def test_execute_lease_endpoint_unexpected_error(client_env, monkeypatch):
+    client, _ = client_env
+
+    def raise_unexpected(*args, **kwargs):
+        raise RuntimeError("Sensitive internal database connection string: db://user:pass@host")
+
+    monkeypatch.setattr(broker.main, "execute_lease_token", raise_unexpected)
+
+    exec_res = client.post(
+        "/leases/execute",
+        json={"lease_token": "some-token"},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert exec_res.status_code == 500
+    assert exec_res.json() == {"detail": "Internal server error"}
+    assert "Sensitive" not in exec_res.text
+    assert "user:pass" not in exec_res.text
+
+
+def test_execute_lease_endpoint_missing_agent_api_key(client_env, monkeypatch):
+    client, _ = client_env
+    monkeypatch.delenv("AGENT_API_KEY", raising=False)
+
+    exec_res = client.post(
+        "/leases/execute",
+        json={"lease_token": "some-token"},
+        headers={"X-Agent-Key": "some-key"},
+    )
+    assert exec_res.status_code == 500
+    assert exec_res.json() == {"detail": "Server configuration error: AGENT_API_KEY is not configured"}
+
+
+def test_execute_lease_endpoint_empty_policy_config_fails(client_env, monkeypatch):
+    client, _ = client_env
+    # Empty string allowed bucket causes service validation failure
+    monkeypatch.setenv("ALLOWED_S3_BUCKET", "")
+
+    exec_res = client.post(
+        "/leases/execute",
+        json={"lease_token": "some-token"},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert exec_res.status_code == 500
+    assert exec_res.json() == {"detail": "Internal server error"}
