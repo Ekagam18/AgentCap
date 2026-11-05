@@ -1,17 +1,10 @@
-"""Execution service layer connecting single-use lease consumption to isolated S3 execution.
-
-Coordinates:
-1. Validating and consuming single-use lease tokens via broker.database.consume_lease.
-2. Executing authorized S3 actions via broker.s3_executor.execute_consumed_lease.
-3. Recording append-only audit events (s3_execution_succeeded, s3_execution_failed,
-   or lease_execution_rejected) without leaking tokens, hashes, credentials, or object contents.
-4. Enforcing fail-closed behavior on audit write failures.
-"""
+"""Fail-closed orchestration for single-use lease execution."""
 
 from __future__ import annotations
 
 import logging
-from typing import Any
+import re
+from typing import Any, Callable
 
 from broker.database import DEFAULT_DB, consume_lease, record_audit_event
 from broker.s3_executor import (
@@ -47,15 +40,15 @@ class ExecutionServiceError(Exception):
 
 
 class InvalidLeaseTokenError(ExecutionServiceError, ValueError):
-    """Raised when a lease token is invalid, expired, or already consumed."""
+    """Raised when a lease token is invalid, expired, already used, or agent-mismatched."""
 
 
 class ExecutionAuditError(ExecutionServiceError):
-    """Raised when writing the execution audit record fails, failing closed."""
+    """Raised when a required execution audit write fails; execution fails closed."""
 
 
 def _map_exception_to_audit_outcome(exc: Exception) -> str:
-    """Map an execution exception to an approved sanitized audit outcome code."""
+    """Map an execution exception to a fixed, sanitized audit outcome."""
     if isinstance(exc, S3ObjectTooLargeError):
         return "S3ObjectTooLargeError"
     if isinstance(exc, PolicyViolationError):
@@ -64,6 +57,20 @@ def _map_exception_to_audit_outcome(exc: Exception) -> str:
         return "S3InvalidLeaseError"
     if isinstance(exc, S3ServiceError):
         return "S3ServiceError"
+    return "UnknownError"
+
+
+def _map_exception_to_audit_detail(exc: Exception) -> str:
+    """Return only a short sanitized error code; never store exception text wholesale."""
+    if isinstance(exc, S3ObjectTooLargeError):
+        return "object_too_large"
+    if isinstance(exc, PolicyViolationError):
+        return "policy_violation"
+    if isinstance(exc, S3InvalidLeaseError):
+        return "invalid_lease_record"
+    if isinstance(exc, S3ServiceError):
+        match = re.search(r"\(([A-Za-z0-9_.-]{1,64})\)", str(exc))
+        return match.group(1) if match else "S3ServiceError"
     return "UnknownError"
 
 
@@ -76,33 +83,18 @@ def execute_lease_token(
     max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
     *,
     lease_token: str | None = None,
+    agent_id: str | None = None,
+    s3_client_factory: Callable[[dict], Any] | None = None,
 ) -> S3ExecutionResult:
-    """Execute authorized S3 operation for a single-use lease token.
+    """Consume and execute one lease, optionally bound to an agent and scoped STS client.
 
-    Args:
-        token: The plaintext lease token provided by the agent.
-        allowed_bucket: Configured allowed S3 bucket.
-        allowed_prefix: Configured allowed S3 prefix.
-        db_path: Database path or active SQLite connection.
-        s3_client: Optional injected S3 client (e.g. for testing).
-        max_object_bytes: Maximum allowed S3 object size in bytes (default 1 MiB).
-        lease_token: Optional keyword alias for token.
-
-    Returns:
-        S3ExecutionResult: The result of the S3 GetObject operation.
-
-    Raises:
-        InvalidLeaseTokenError: If the token is invalid, expired, or already consumed.
-        PolicyViolationError: If action or resource violates configured policy.
-        S3ObjectTooLargeError: If object exceeds max_object_bytes.
-        S3ServiceError: If S3 client/service fails.
-        ExecutionAuditError: If audit event writing fails (failing closed).
-        ValueError: If configuration arguments are invalid.
+    Configuration is validated before token consumption. The lease is then consumed
+    atomically exactly once. ``s3_client_factory`` is invoked only with the trusted
+    database lease record returned by ``consume_lease``.
     """
     if lease_token is not None:
         token = lease_token
 
-    # Validate configuration parameters upfront
     if not isinstance(allowed_bucket, str) or not allowed_bucket.strip():
         raise ValueError("allowed_bucket must be a non-empty string")
     if not isinstance(allowed_prefix, str) or not allowed_prefix.strip():
@@ -114,14 +106,12 @@ def execute_lease_token(
     ):
         raise ValueError("max_object_bytes must be a non-negative integer")
 
-    # 1. Validate token input without logging or exposing it
-    # 2. Call existing consume_lease() exactly once
+    # Do not strip or normalize tokens: a padded token must not consume a valid lease.
     if not isinstance(token, str):
-        consumed_lease = consume_lease("", db_path=db_path)
+        consumed_lease = consume_lease("", db_path=db_path, agent_id=agent_id)
     else:
-        consumed_lease = consume_lease(token, db_path=db_path)
+        consumed_lease = consume_lease(token, db_path=db_path, agent_id=agent_id)
 
-    # 3. If consumption returns None, record lease_execution_rejected and raise safe custom exception
     if consumed_lease is None:
         try:
             record_audit_event(
@@ -132,48 +122,54 @@ def execute_lease_token(
                 resource=None,
                 lease_id=None,
                 db_path=db_path,
+                agent_id=agent_id,
+                detail="invalid_token",
             )
         except Exception as audit_exc:
-            raise ExecutionAuditError("Failed to record lease rejection audit event") from audit_exc
+            raise ExecutionAuditError(
+                "Failed to record lease rejection audit event"
+            ) from audit_exc
+        raise InvalidLeaseTokenError(
+            "Invalid, expired, or already consumed lease token"
+        )
 
-        raise InvalidLeaseTokenError("Invalid, expired, or already consumed lease token")
-
-    # 4. Use only the returned consumed-lease record when calling execute_consumed_lease()
     task_id = consumed_lease.get("task_id")
     action = consumed_lease.get("action")
     resource = consumed_lease.get("resource")
     lease_id = consumed_lease.get("lease_id")
+    lease_agent_id = consumed_lease.get("agent_id")
 
     try:
+        resolved_s3_client = s3_client
+        if resolved_s3_client is None and s3_client_factory is not None:
+            resolved_s3_client = s3_client_factory(consumed_lease)
+
         result = execute_consumed_lease(
             consumed_lease=consumed_lease,
             allowed_bucket=allowed_bucket,
             allowed_prefix=allowed_prefix,
-            s3_client=s3_client,
+            s3_client=resolved_s3_client,
             max_object_bytes=max_object_bytes,
         )
-    except Exception as exec_exc:
-        # 6. On execution failure, record s3_execution_failed using only approved sanitized outcomes
-        # 7. Never store raw exception text, AWS credentials, lease tokens, or object contents in audit records
-        # 8. Keep the lease consumed even if the S3 operation fails
-        outcome = _map_exception_to_audit_outcome(exec_exc)
+    except Exception as execution_exc:
         try:
             record_audit_event(
                 event_type="s3_execution_failed",
-                outcome=outcome,
+                outcome=_map_exception_to_audit_outcome(execution_exc),
                 task_id=task_id,
                 action=action,
                 resource=resource,
                 lease_id=lease_id,
                 db_path=db_path,
+                agent_id=lease_agent_id or agent_id,
+                detail=_map_exception_to_audit_detail(execution_exc),
             )
         except Exception as audit_exc:
-            raise ExecutionAuditError("Failed to record execution failure audit event") from audit_exc
+            raise ExecutionAuditError(
+                "Failed to record execution failure audit event"
+            ) from audit_exc
         raise
 
-    # 5. On successful execution, record s3_execution_succeeded with outcome success
-    # 9. Fail closed if the required audit write fails. Never report a successful execution
-    #    if its success audit record could not be written.
     try:
         record_audit_event(
             event_type="s3_execution_succeeded",
@@ -183,6 +179,8 @@ def execute_lease_token(
             resource=resource,
             lease_id=lease_id,
             db_path=db_path,
+            agent_id=lease_agent_id or agent_id,
+            detail=f"bytes={result.content_length}",
         )
     except Exception as audit_exc:
         raise ExecutionAuditError(
