@@ -1,6 +1,6 @@
 # AgentCap Authorization Broker
 
-A minimal, secure authorization broker built with Python 3.12 and FastAPI. It enforces strict default-deny policies, decouples task approval by administrators from agent execution, and issues single-use, time-bound authorization leases.
+A minimal authorization broker built with Python 3.12 and FastAPI. It enforces strict default-deny policies, separates administrator task approval from agent execution, and issues single-use, time-bound authorization leases.
 
 ---
 
@@ -27,25 +27,27 @@ Configure environment variables before starting the broker or running tasks. You
 
 | Variable | Description | Example / Default |
 |---|---|---|
-| `ADMIN_API_KEY` | Secret key for trusted task registration | `admin-secret-key-123` (Required) |
-| `AGENT_API_KEY` | Secret key for agent lease requests | `agent-secret-key-456` (Required) |
-| `AGENT_ID` | Bound agent identity for the configured agent key | `agent-default` |
-| `ALLOWED_S3_BUCKET` | Allowed S3 bucket | `agentcap-demo` |
-| `ALLOWED_S3_PREFIX` | Allowed S3 key prefix | `reports/` |
-| `TASK_TTL_SECONDS` | How long an approved task stays valid (seconds) | `900` (Default) |
-| `AWS_ROLE_ARN` | IAM role assumed per lease with a one-object session policy (see `docs/aws-sts-setup.md`). Unset = broker's default creds, dev only | unset (Default) |
-| `S3_MAX_OBJECT_BYTES` | Largest object `/leases/execute` will return (bytes) | `1048576` (Default, 1 MiB) |
-| `DATABASE_PATH` | Path to SQLite database file | `broker/agentcap.db` (Default) |
+| `ADMIN_API_KEY` | Secret key for trusted task registration | Required |
+| `AGENT_API_KEY` | Secret key for agent lease requests and execution | Required |
+| `AGENT_ID` | Identity bound to the configured agent key | `agent-default` |
+| `ALLOWED_S3_BUCKET` | Only bucket the broker may access | `agentcap-demo` |
+| `ALLOWED_S3_PREFIX` | Only key prefix the broker may access | `reports/` |
+| `TASK_TTL_SECONDS` | How long an approved task remains valid | `900` (default) |
+| `AWS_ROLE_ARN` | IAM role assumed per lease with a one-object session policy; see [AWS STS setup](docs/aws-sts-setup.md) | Unset (default; broker credentials used for local development) |
+| `S3_MAX_OBJECT_BYTES` | Maximum object size returned by the execution API | `1048576` (default, 1 MiB) |
+| `DATABASE_PATH` | SQLite database file path | `broker/agentcap.db` (default) |
 
-Set them in PowerShell:
+Set the required values in PowerShell:
 
 ```powershell
-$env:ADMIN_API_KEY="admin-secret-key-123"
-$env:AGENT_API_KEY="agent-secret-key-456"
-$env:AGENT_ID="agent-default"
-$env:ALLOWED_S3_BUCKET="agentcap-demo"
-$env:ALLOWED_S3_PREFIX="reports/"
+$env:ADMIN_API_KEY = "replace-with-a-long-random-admin-secret"
+$env:AGENT_API_KEY = "replace-with-a-different-long-random-agent-secret"
+$env:AGENT_ID = "agent-default"
+$env:ALLOWED_S3_BUCKET = "agentcap-demo"
+$env:ALLOWED_S3_PREFIX = "reports/"
 ```
+
+The values above are examples, not production secrets. Do not commit real API keys, AWS credentials, or populated `.env` files. For an AWS deployment, configure `AWS_ROLE_ARN` and give the broker identity only `sts:AssumeRole` permission; see the STS setup guide.
 
 ---
 
@@ -58,6 +60,7 @@ Run the server with Uvicorn:
 ```
 
 Health check:
+
 ```powershell
 Invoke-RestMethod -Uri http://127.0.0.1:8000/health -Method GET
 ```
@@ -66,21 +69,24 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/health -Method GET
 
 ## 4. Running the Tests
 
-Execute pytest using the virtual environment:
+Execute the full test suite using the virtual environment:
 
 ```powershell
-.\.venv\Scripts\pytest.exe -v
+.\.venv\Scripts\python.exe -m pytest -q
 ```
+
+The unit and integration tests use mocked AWS clients. They do not require live AWS credentials or make real AWS requests.
 
 ---
 
 ## 5. Usage & API Flow
 
 ### Step A: Trusted Task Registration (`POST /tasks`)
+
 A trusted administrator approves an exact action and resource. The task is bound to the configured agent identity.
 
 ```powershell
-$adminHeaders = @{ "X-Admin-Key" = "admin-secret-key-123" }
+$adminHeaders = @{ "X-Admin-Key" = $env:ADMIN_API_KEY }
 $taskBody = @{
     action   = "s3:GetObject"
     resource = "s3://agentcap-demo/reports/q3-report.txt"
@@ -90,11 +96,12 @@ $task = Invoke-RestMethod -Uri http://127.0.0.1:8000/tasks -Method POST -Headers
 Write-Host "Task approved with ID: $($task.task_id)"
 ```
 
-### Step B: Agent Requests Lease (`POST /leases`)
-The authenticated AI agent requests a lease by providing the approved `task_id`, matching `action`, and matching `resource`.
+### Step B: Agent Requests a Lease (`POST /leases`)
+
+The authenticated agent requests a lease by providing the approved `task_id`, matching `action`, and matching `resource`.
 
 ```powershell
-$agentHeaders = @{ "X-Agent-Key" = "agent-secret-key-456" }
+$agentHeaders = @{ "X-Agent-Key" = $env:AGENT_API_KEY }
 $leaseBody = @{
     task_id  = $task.task_id
     action   = "s3:GetObject"
@@ -102,60 +109,101 @@ $leaseBody = @{
 } | ConvertTo-Json
 
 $lease = Invoke-RestMethod -Uri http://127.0.0.1:8000/leases -Method POST -Headers $agentHeaders -ContentType "application/json" -Body $leaseBody
-Write-Host "Issued lease token: $($lease.lease_token)"
+Write-Host "Lease issued; expires in $($lease.expires_in) seconds."
 ```
 
+Keep `$lease.lease_token` in memory and do not print it or write it to logs.
+
 ### Step C: Agent Spends the Lease (`POST /leases/execute`)
-The agent sends only the token. The broker consumes it (once), runs the single approved `s3:GetObject`, and returns the object bytes. AWS credentials stay on the broker and never reach the agent.
+
+The agent sends only the lease token in the request body (along with its agent authentication header). The broker consumes the lease once, performs the approved `s3:GetObject`, and returns a JSON response containing the object bytes encoded as Base64. AWS credentials remain inside the broker and are never returned to the agent.
 
 ```powershell
 $execBody = @{ lease_token = $lease.lease_token } | ConvertTo-Json
-Invoke-WebRequest -Uri http://127.0.0.1:8000/leases/execute -Method POST -Headers $agentHeaders -ContentType "application/json" -Body $execBody -OutFile q3-report.txt
+$execResponse = Invoke-RestMethod -Uri http://127.0.0.1:8000/leases/execute -Method POST -Headers $agentHeaders -ContentType "application/json" -Body $execBody
+
+# Decode the JSON Base64 field back into the original object bytes.
+$fileBytes = [Convert]::FromBase64String($execResponse.content_base64)
+
+# Check the decoded byte count before writing the file.
+if ($fileBytes.Length -ne $execResponse.content_length) {
+    throw "Downloaded object length did not match the broker response."
+}
+
+[System.IO.File]::WriteAllBytes((Join-Path (Get-Location) "q3-report.txt"), $fileBytes)
+Write-Host "Downloaded $($fileBytes.Length) bytes to q3-report.txt"
 ```
 
-| Response | Meaning |
-|---|---|
-| `200` | Object bytes, with `Cache-Control: no-store` and `X-Content-Type-Options: nosniff` |
-| `403` | Token unknown, expired, already used, or issued to another agent (one uniform message), or policy no longer allows the scope |
-| `413` | Object is larger than `S3_MAX_OBJECT_BYTES` |
-| `502` | S3 refused or failed (only the AWS error code is kept, in the audit log) |
+The successful JSON response contains:
 
-The lease is consumed before S3 is called, so it is spent even when S3 fails and can never be replayed.
+| Field | Meaning |
+|---|---|
+| `content_base64` | Object bytes encoded as Base64 |
+| `content_length` | Number of decoded object bytes |
+| `content_type` | Optional S3 content-type metadata |
+| `etag` | Optional S3 entity tag |
+
+The response also includes `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+
+| HTTP status | Meaning |
+|---|---|
+| `200` | Execution succeeded; response is JSON with Base64 content |
+| `401` | Missing or invalid agent API key |
+| `403` | Invalid, expired, replayed, or wrong-agent lease; or policy violation |
+| `404` | Task not found |
+| `409` | Task has already issued its one permitted lease |
+| `413` | Object is larger than `S3_MAX_OBJECT_BYTES` |
+| `500` | Invalid server configuration or unexpected internal error |
+| `502` | S3 or STS execution failed |
+| `503` | Required audit write failed; execution fails closed |
+
+The lease is consumed before S3 is called. It remains spent even if S3 or STS fails, and it can never be replayed.
 
 ---
 
-## 6. Policy Enforcement & Denied Requests
+## 6. Policy Enforcement & Audit
 
 The broker enforces:
-- **Default Deny**: Only `s3:GetObject` on the configured bucket and prefix is permitted.
-- **Strict Scope**: Actions, bucket, prefix, and task parameters must match approved records exactly.
-- **No Wildcards / Traversal**: Reject `*`, `?`, `..`, and malformed URIs.
-- **Single-Use, Expiring Approvals**: Each approved task issues exactly one lease, and only before it expires (`TASK_TTL_SECONDS`). A second request returns `409 Conflict`; an expired task returns `403 Forbidden`.
-- **Agent-Bound Leases**: Every lease records the agent it was issued to, and `consume_lease(token, agent_id=...)` refuses a token presented by any other agent.
-- **Audited Execution**: Every execution attempt is logged as `s3_execution_succeeded`, `s3_execution_failed`, or `execution_denied`. Tokens are never written to the log.
-- **Per-Lease AWS Credentials**: With `AWS_ROLE_ARN` set, each execution calls STS AssumeRole with an inline session policy allowing only `s3:GetObject` on the leased object. The credentials stay inside the broker.
-- **Identity Isolation**: The agent cannot register its own tasks (`401 Unauthorized`), nor can it claim a task approved for another agent (`403 Forbidden`).
 
-### Denied Request Examples
+- **Default deny:** Only `s3:GetObject` on the configured bucket and prefix is permitted.
+- **Strict scope:** The action, bucket, prefix, and resource must match the administrator-approved task.
+- **No wildcards or traversal:** Wildcards, query markers, path traversal, fragments, and malformed S3 URIs are rejected.
+- **Single-use, expiring approvals:** Each approved task can issue exactly one lease, and only before the task expires.
+- **Agent-bound leases:** A lease is tied to the configured agent identity and cannot be consumed by another agent.
+- **Fail-closed auditing:** Required audit writes must succeed; otherwise the operation is rejected or reported as unavailable.
+- **Append-only audit history:** Audit records cannot be updated or deleted through the database triggers.
+- **Per-lease AWS credentials:** When `AWS_ROLE_ARN` is configured, the broker calls STS AssumeRole with an inline session policy allowing only `s3:GetObject` on the leased object. Temporary credentials stay inside the broker.
+- **Credential hygiene:** Lease tokens, token hashes, AWS credentials, object contents, and raw exception messages are not written to audit events.
 
-#### 1. Unauthorized Action (`s3:DeleteObject`)
+Audit events cover task registration, lease issuance/denial/consumption, rejected execution attempts, and S3 execution success or failure.
+
+### Denied request examples
+
+#### 1. Unauthorized action (`s3:DeleteObject`)
+
+An attempt to register an unapproved action returns `403 Forbidden`:
+
 ```powershell
-# Attempting to register an unapproved action returns 403 Forbidden:
-Invoke-RestMethod -Uri http://127.0.0.1:8000/tasks -Method POST -Headers $adminHeaders -ContentType "application/json" -Body (@{
+$badTaskBody = @{
     action   = "s3:DeleteObject"
     resource = "s3://agentcap-demo/reports/q3-report.txt"
-} | ConvertTo-Json)
-# Result: 403 Forbidden: Action 's3:DeleteObject' is not permitted; only 's3:GetObject' is allowed
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri http://127.0.0.1:8000/tasks -Method POST -Headers $adminHeaders -ContentType "application/json" -Body $badTaskBody
 ```
 
-#### 2. Scope Mismatch on Lease Request
+#### 2. Scope mismatch on lease request
+
+An attempt to request a lease for a different resource than the one approved returns `403 Forbidden`:
+
 ```powershell
-# Attempting to request a lease for a different resource than approved returns 403 Forbidden:
-Invoke-RestMethod -Uri http://127.0.0.1:8000/leases -Method POST -Headers $agentHeaders -ContentType "application/json" -Body (@{
+$badLeaseBody = @{
     task_id  = $task.task_id
     action   = "s3:GetObject"
     resource = "s3://agentcap-demo/reports/unapproved-payroll.txt"
-} | ConvertTo-Json)
-# Result: 403 Forbidden: Requested resource does not match approved task
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri http://127.0.0.1:8000/leases -Method POST -Headers $agentHeaders -ContentType "application/json" -Body $badLeaseBody
 ```
-No lease is created in the database when any check fails.
+
+No lease is created when the request fails validation.
