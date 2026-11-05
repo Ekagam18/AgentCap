@@ -4,6 +4,7 @@ S3 is replaced by a fake client through FastAPI's dependency overrides,
 so these tests never touch AWS.
 """
 
+import base64
 import io
 import time
 
@@ -101,8 +102,8 @@ def test_full_flow_returns_object_bytes(env):
     res = _execute(client, token)
 
     assert res.status_code == 200
-    assert res.content == CONTENT
-    assert res.headers["content-type"].startswith("text/plain")
+    assert base64.b64decode(res.json()["content_base64"]) == CONTENT
+    assert res.json()["content_type"].startswith("text/plain")
     assert res.headers["cache-control"] == "no-store"
     assert res.headers["x-content-type-options"] == "nosniff"
     assert fake.calls == [(BUCKET, KEY)]
@@ -140,7 +141,7 @@ def test_unsafe_content_type_falls_back_to_octet_stream(env):
     res = _execute(client, token)
 
     assert res.status_code == 200
-    assert res.headers["content-type"] == "application/octet-stream"
+    assert res.json()["content_type"] == "application/octet-stream"
     assert "set-cookie" not in res.headers
 
 
@@ -156,8 +157,11 @@ def test_replayed_lease_is_rejected(env):
 
     assert replay.status_code == 403
     assert len(fake.calls) == 1
-    denied = get_audit_events(event_type="execution_denied", db_path=db_file)
-    assert len(denied) == 1 and denied[0]["detail"] == "invalid_lease"
+    denied = get_audit_events(
+        event_type="lease_execution_rejected",
+        db_path=db_file,
+    )
+    assert len(denied) == 1 and denied[0]["detail"] == "invalid_token"
 
 
 def test_second_lease_for_same_task_is_conflict(env):

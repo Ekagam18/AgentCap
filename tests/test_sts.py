@@ -1,5 +1,6 @@
 """Tests for per-lease STS AssumeRole credentials (no AWS calls are made)."""
 
+import base64
 import io
 import json
 
@@ -202,7 +203,8 @@ def test_execute_uses_scoped_sts_credentials(env):
     res = _execute(client, _get_token(client))
 
     assert res.status_code == 200
-    assert res.content == CONTENT
+    assert base64.b64decode(res.json()["content_base64"]) == CONTENT
+    assert res.json()["content_length"] == len(CONTENT)
     assert len(sts.calls) == 1
     assert json.loads(sts.calls[0]["Policy"])["Statement"][0]["Resource"] == (
         "arn:aws:s3:::agentcap-demo/reports/q3-report.txt"

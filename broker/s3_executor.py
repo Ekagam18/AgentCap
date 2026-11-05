@@ -345,12 +345,24 @@ def execute_consumed_lease(
     if isinstance(etag, str):
         etag = etag.strip('"')
 
+    content_type = response.get("ContentType")
+    # ContentType is returned as metadata in the JSON API. Reject control
+    # characters and malformed/oversized values rather than reflecting them.
+    if (
+        not isinstance(content_type, str)
+        or not content_type.strip()
+        or len(content_type) > 256
+        or "\r" in content_type
+        or "\n" in content_type
+    ):
+        content_type = "application/octet-stream"
+
     return S3ExecutionResult(
         bucket=bucket,
         key=key,
         content_bytes=content_bytes,
         content_length=len(content_bytes),
-        content_type=response.get("ContentType"),
+        content_type=content_type,
         etag=etag,
         version_id=response.get("VersionId"),
         last_modified=response.get("LastModified"),
