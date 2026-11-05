@@ -23,6 +23,7 @@ from broker.s3_executor import (
     S3ServiceError,
     execute_consumed_lease,
 )
+from broker.sts import StsAssumeRoleError, scoped_s3_client_for_lease, validate_role_arn
 from broker.tasks import DEFAULT_TASK_TTL_SECONDS, create_task, get_task
 from policy.checks import (
     PolicyViolationError,
@@ -101,6 +102,34 @@ def get_s3_client() -> Any:
     Tests override this dependency with a fake client so no AWS call is made.
     """
     return None
+
+
+def get_sts_client() -> Any:
+    """STS client used to assume the execution role. None means a default boto3 client."""
+    return None
+
+
+def get_s3_client_builder() -> Any:
+    """Builds an S3 client from temporary credentials. None means boto3. Tests override this."""
+    return None
+
+
+def get_role_arn() -> str | None:
+    """AWS_ROLE_ARN enables per-lease STS credentials. Invalid value -> 500, fail closed.
+
+    Unset means local/dev mode: the executor uses the broker's default boto3 credentials.
+    """
+    role_arn = os.getenv("AWS_ROLE_ARN", "").strip()
+    if not role_arn:
+        return None
+    try:
+        validate_role_arn(role_arn)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server configuration error: AWS_ROLE_ARN is not a valid IAM role ARN",
+        )
+    return role_arn
 
 
 def get_max_object_bytes() -> int:
@@ -250,6 +279,9 @@ def execute_lease_endpoint(
     db_path: Path = Depends(get_db_path),
     s3_client: Any = Depends(get_s3_client),
     max_object_bytes: int = Depends(get_max_object_bytes),
+    role_arn: str | None = Depends(get_role_arn),
+    sts_client: Any = Depends(get_sts_client),
+    s3_client_builder: Any = Depends(get_s3_client_builder),
 ) -> Response:
     """Spend a lease: consume it once, then run its single S3 GetObject."""
     # Consuming first means a lease is spent even if S3 then fails; it can never be replayed.
@@ -264,6 +296,11 @@ def execute_lease_endpoint(
 
     allowed_bucket, allowed_prefix = get_policy_config()
     try:
+        if role_arn and s3_client is None:
+            # Temporary credentials that can read only this lease's object.
+            s3_client = scoped_s3_client_for_lease(
+                lease, role_arn, sts_client=sts_client, s3_client_builder=s3_client_builder
+            )
         result = execute_consumed_lease(
             lease,
             allowed_bucket=allowed_bucket,
@@ -280,6 +317,9 @@ def execute_lease_endpoint(
             status_code=413,  # Content Too Large
             detail=f"Object exceeds the {max_object_bytes} byte limit",
         )
+    except StsAssumeRoleError as err:
+        _audit_execution_failed(lease, agent_id, str(err)[:200], db_path)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not obtain scoped AWS credentials")
     except S3ServiceError as err:
         # Executor messages are already sanitized (error code only, no credentials).
         _audit_execution_failed(lease, agent_id, str(err)[:200], db_path)

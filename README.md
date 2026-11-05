@@ -33,6 +33,7 @@ Configure environment variables before starting the broker or running tasks. You
 | `ALLOWED_S3_BUCKET` | Allowed S3 bucket | `agentcap-demo` |
 | `ALLOWED_S3_PREFIX` | Allowed S3 key prefix | `reports/` |
 | `TASK_TTL_SECONDS` | How long an approved task stays valid (seconds) | `900` (Default) |
+| `AWS_ROLE_ARN` | IAM role assumed per lease with a one-object session policy (see `docs/aws-sts-setup.md`). Unset = broker's default creds, dev only | unset (Default) |
 | `S3_MAX_OBJECT_BYTES` | Largest object `/leases/execute` will return (bytes) | `1048576` (Default, 1 MiB) |
 | `DATABASE_PATH` | Path to SQLite database file | `broker/agentcap.db` (Default) |
 
@@ -132,6 +133,7 @@ The broker enforces:
 - **Single-Use, Expiring Approvals**: Each approved task issues exactly one lease, and only before it expires (`TASK_TTL_SECONDS`). A second request returns `409 Conflict`; an expired task returns `403 Forbidden`.
 - **Agent-Bound Leases**: Every lease records the agent it was issued to, and `consume_lease(token, agent_id=...)` refuses a token presented by any other agent.
 - **Audited Execution**: Every execution attempt is logged as `s3_execution_succeeded`, `s3_execution_failed`, or `execution_denied`. Tokens are never written to the log.
+- **Per-Lease AWS Credentials**: With `AWS_ROLE_ARN` set, each execution calls STS AssumeRole with an inline session policy allowing only `s3:GetObject` on the leased object. The credentials stay inside the broker.
 - **Identity Isolation**: The agent cannot register its own tasks (`401 Unauthorized`), nor can it claim a task approved for another agent (`403 Forbidden`).
 
 ### Denied Request Examples
