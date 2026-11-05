@@ -7,8 +7,8 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from broker.database import DEFAULT_DB, issue_lease
-from broker.tasks import create_task, get_task
+from broker.database import DEFAULT_DB, TaskUnavailableError, issue_lease_for_task, record_audit_event
+from broker.tasks import DEFAULT_TASK_TTL_SECONDS, create_task, get_task
 from policy.checks import (
     PolicyViolationError,
     validate_action_and_resource,
@@ -16,6 +16,8 @@ from policy.checks import (
 )
 
 app = FastAPI(title="AgentCap Authorization Broker")
+
+LEASE_TTL_SECONDS = 60
 
 
 class TaskCreateRequest(BaseModel):
@@ -30,6 +32,7 @@ class TaskResponse(BaseModel):
     agent_id: str
     action: str
     resource: str
+    expires_in: int
 
 
 class LeaseCreateRequest(BaseModel):
@@ -55,6 +58,21 @@ def get_db_path() -> Path:
 
 def get_configured_agent_id() -> str:
     return os.getenv("AGENT_ID", "agent-default")
+
+
+def get_task_ttl_seconds() -> int:
+    """How long an admin approval stays valid before its lease must be requested."""
+    raw = os.getenv("TASK_TTL_SECONDS", str(DEFAULT_TASK_TTL_SECONDS))
+    try:
+        ttl = int(raw)
+    except ValueError:
+        ttl = 0
+    if ttl <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server configuration error: TASK_TTL_SECONDS must be a positive integer",
+        )
+    return ttl
 
 
 def get_policy_config() -> tuple[str, str]:
@@ -110,12 +128,14 @@ def register_task(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(err))
 
     agent_id = get_configured_agent_id()
-    task = create_task(agent_id, payload.action, payload.resource, db_path=db_path)
+    ttl_seconds = get_task_ttl_seconds()
+    task = create_task(agent_id, payload.action, payload.resource, db_path=db_path, ttl_seconds=ttl_seconds)
     return TaskResponse(
         task_id=task["task_id"],
         agent_id=task["agent_id"],
         action=task["action"],
         resource=task["resource"],
+        expires_in=ttl_seconds,
     )
 
 
@@ -127,6 +147,7 @@ def issue_lease_endpoint(
 ) -> LeaseResponse:
     task = get_task(payload.task_id, db_path=db_path)
     if not task:
+        _audit_lease_denied(payload, agent_id, "task_not_found", db_path)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
     allowed_bucket, allowed_prefix = get_policy_config()
@@ -134,13 +155,43 @@ def issue_lease_endpoint(
         validate_task_match(task, agent_id, payload.action, payload.resource)
         validate_action_and_resource(payload.action, payload.resource, allowed_bucket, allowed_prefix)
     except PolicyViolationError as err:
+        _audit_lease_denied(payload, agent_id, "policy_violation", db_path)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(err))
 
-    token = issue_lease(
-        payload.task_id,
-        payload.action,
-        payload.resource,
-        ttl_seconds=60,
-        db_path=db_path,
-    )
-    return LeaseResponse(lease_token=token, expires_in=60, token_type="Bearer")
+    # Claim the task and issue its single lease in one transaction, so two
+    # concurrent requests can never both get a lease for the same approval.
+    try:
+        token = issue_lease_for_task(
+            payload.task_id,
+            agent_id,
+            payload.action,
+            payload.resource,
+            ttl_seconds=LEASE_TTL_SECONDS,
+            db_path=db_path,
+        )
+    except TaskUnavailableError as err:
+        _audit_lease_denied(payload, agent_id, err.reason, db_path)
+        status_code = {
+            "not_found": status.HTTP_404_NOT_FOUND,
+            "already_used": status.HTTP_409_CONFLICT,
+        }.get(err.reason, status.HTTP_403_FORBIDDEN)
+        raise HTTPException(status_code=status_code, detail=str(err))
+
+    return LeaseResponse(lease_token=token, expires_in=LEASE_TTL_SECONDS, token_type="Bearer")
+
+
+def _audit_lease_denied(payload: LeaseCreateRequest, agent_id: str, reason: str, db_path: Path) -> None:
+    """Record a refused lease request. Never raises, so auditing can't mask the denial."""
+    try:
+        record_audit_event(
+            "lease_denied",
+            payload.task_id,
+            payload.action,
+            payload.resource,
+            "denied",
+            agent_id=agent_id,
+            detail=reason,
+            db_path=db_path,
+        )
+    except Exception:
+        pass

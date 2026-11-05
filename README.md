@@ -32,6 +32,7 @@ Configure environment variables before starting the broker or running tasks. You
 | `AGENT_ID` | Bound agent identity for the configured agent key | `agent-default` |
 | `ALLOWED_S3_BUCKET` | Allowed S3 bucket | `agentcap-demo` |
 | `ALLOWED_S3_PREFIX` | Allowed S3 key prefix | `reports/` |
+| `TASK_TTL_SECONDS` | How long an approved task stays valid (seconds) | `900` (Default) |
 | `DATABASE_PATH` | Path to SQLite database file | `broker/agentcap.db` (Default) |
 
 Set them in PowerShell:
@@ -110,6 +111,8 @@ The broker enforces:
 - **Default Deny**: Only `s3:GetObject` on the configured bucket and prefix is permitted.
 - **Strict Scope**: Actions, bucket, prefix, and task parameters must match approved records exactly.
 - **No Wildcards / Traversal**: Reject `*`, `?`, `..`, and malformed URIs.
+- **Single-Use, Expiring Approvals**: Each approved task issues exactly one lease, and only before it expires (`TASK_TTL_SECONDS`). A second request returns `409 Conflict`; an expired task returns `403 Forbidden`.
+- **Agent-Bound Leases**: Every lease records the agent it was issued to, and `consume_lease(token, agent_id=...)` refuses a token presented by any other agent.
 - **Identity Isolation**: The agent cannot register its own tasks (`401 Unauthorized`), nor can it claim a task approved for another agent (`403 Forbidden`).
 
 ### Denied Request Examples
