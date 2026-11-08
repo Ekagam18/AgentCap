@@ -30,11 +30,12 @@ Configure environment variables before starting the broker or running tasks. You
 | `ADMIN_API_KEY` | Secret key for trusted task registration | Required |
 | `AGENT_API_KEY` | Secret key for agent lease requests and execution | Required |
 | `AGENT_ID` | Identity bound to the configured agent key | `agent-default` |
-| `ALLOWED_S3_BUCKET` | Only bucket the broker may access | `agentcap-demo` |
-| `ALLOWED_S3_PREFIX` | Only key prefix the broker may access | `reports/` |
+| `ALLOWED_S3_BUCKET` | Only bucket the broker may access | Required (e.g. `agentcap-demo`) |
+| `ALLOWED_S3_PREFIX` | Only key prefix the broker may access | Required (e.g. `reports/`) |
 | `TASK_TTL_SECONDS` | How long an approved task remains valid | `900` (default) |
 | `AWS_ROLE_ARN` | IAM role assumed per lease with a one-object session policy; see [AWS STS setup](docs/aws-sts-setup.md) | Unset (default; broker credentials used for local development) |
 | `S3_MAX_OBJECT_BYTES` | Maximum object size returned by the execution API | `1048576` (default, 1 MiB) |
+| `AGENTCAP_URL` | Broker base URL used by the Python agent CLI | `http://127.0.0.1:8000` (default) |
 | `DATABASE_PATH` | SQLite database file path | `broker/agentcap.db` (default) |
 
 Set the required values in PowerShell:
@@ -95,6 +96,27 @@ $taskBody = @{
 $task = Invoke-RestMethod -Uri http://127.0.0.1:8000/tasks -Method POST -Headers $adminHeaders -ContentType "application/json" -Body $taskBody
 Write-Host "Task approved with ID: $($task.task_id)"
 ```
+
+### Alternative: Use the Python Agent CLI
+
+Instead of manually following Steps B and C, the Python agent client can request a lease and execute the approved operation in one command.
+
+Ensure `AGENT_API_KEY` is set in the shell running the agent. It must match the key configured in the broker. `AGENTCAP_URL` is optional and defaults to `http://127.0.0.1:8000`.
+
+```powershell
+.\.venv\Scripts\python.exe -m agent `
+    --task-id $task.task_id `
+    --action "s3:GetObject" `
+    --resource "s3://agentcap-demo/reports/q3-report.txt" `
+    --output ".\q3-report-agent-output.txt"
+```
+
+The CLI requests the lease, submits it for execution, validates the response, and saves the returned object. The output file must not already exist, and its parent directory must exist.
+
+The CLI does not print the lease token or object contents. It reports the number of bytes saved and the output path.
+
+**Important:** Use either the Python CLI or the manual Steps B and C for a given task, not both. Each approved task can issue only one lease.
+
 
 ### Step B: Agent Requests a Lease (`POST /leases`)
 
