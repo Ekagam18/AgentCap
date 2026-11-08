@@ -161,10 +161,23 @@ def get_max_object_bytes() -> int:
 
 
 def get_policy_config() -> tuple[str, str]:
-    return (
-        os.getenv("ALLOWED_S3_BUCKET", "agentcap-demo"),
-        os.getenv("ALLOWED_S3_PREFIX", "reports/"),
-    )
+    raw_bucket = os.getenv("ALLOWED_S3_BUCKET")
+    raw_prefix = os.getenv("ALLOWED_S3_PREFIX")
+
+    bucket = raw_bucket.strip() if raw_bucket else ""
+    prefix = raw_prefix.strip() if raw_prefix else ""
+
+    if not bucket:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server configuration error: ALLOWED_S3_BUCKET is not configured",
+        )
+    if not prefix:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server configuration error: ALLOWED_S3_PREFIX is not configured",
+        )
+    return bucket, prefix
 
 
 def authenticate_admin(
@@ -270,6 +283,7 @@ def _audit_lease_denied(
 @app.post("/leases", response_model=LeaseResponse, status_code=status.HTTP_201_CREATED)
 def issue_lease_endpoint(
     payload: LeaseCreateRequest,
+    response: Response,
     agent_id: str = Depends(authenticate_agent),
     db_path: Path = Depends(get_db_path),
 ) -> LeaseResponse:
@@ -318,6 +332,8 @@ def issue_lease_endpoint(
             "already_used": status.HTTP_409_CONFLICT,
         }.get(err.reason, status.HTTP_403_FORBIDDEN)
         raise HTTPException(status_code=status_code, detail=str(err))
+
+    response.headers["Cache-Control"] = "no-store"
 
     return LeaseResponse(
         lease_token=token,

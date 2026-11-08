@@ -133,6 +133,7 @@ def test_1_approved_action_and_resource_lease_issued(client_env):
         headers={"X-Agent-Key": AGENT_KEY},
     )
     assert lease_res.status_code == 201
+    assert lease_res.headers.get("Cache-Control") == "no-store"
     data = lease_res.json()
     assert "lease_token" in data
     assert data["expires_in"] == 60
@@ -861,7 +862,7 @@ def test_execute_lease_endpoint_missing_agent_api_key(client_env, monkeypatch):
 
 def test_execute_lease_endpoint_empty_policy_config_fails(client_env, monkeypatch):
     client, _ = client_env
-    # Empty string allowed bucket causes service validation failure
+    # Empty string allowed bucket causes configuration error
     monkeypatch.setenv("ALLOWED_S3_BUCKET", "")
 
     exec_res = client.post(
@@ -870,4 +871,156 @@ def test_execute_lease_endpoint_empty_policy_config_fails(client_env, monkeypatc
         headers={"X-Agent-Key": AGENT_KEY},
     )
     assert exec_res.status_code == 500
-    assert exec_res.json() == {"detail": "Internal server error"}
+    assert exec_res.json() == {"detail": "Server configuration error: ALLOWED_S3_BUCKET is not configured"}
+
+
+def test_lease_issuance_response_has_no_store_cache_control(client_env):
+    """Verify POST /leases response includes Cache-Control: no-store without leaking token."""
+    client, _ = client_env
+    task_res = _register_task(client)
+    assert task_res.status_code == 201
+    task_id = task_res.json()["task_id"]
+
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert lease_res.status_code == 201
+    assert lease_res.headers.get("Cache-Control") == "no-store"
+    assert "lease_token" in lease_res.json()
+
+
+def test_policy_config_missing_bucket_fails_closed(client_env, monkeypatch):
+    """Verify missing ALLOWED_S3_BUCKET fails closed with HTTP 500 across endpoints."""
+    client, _ = client_env
+    task_res = _register_task(client)
+    assert task_res.status_code == 201
+    task_id = task_res.json()["task_id"]
+
+    monkeypatch.delenv("ALLOWED_S3_BUCKET", raising=False)
+
+    t_res = client.post(
+        "/tasks",
+        json={"action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Admin-Key": ADMIN_KEY},
+    )
+    assert t_res.status_code == 500
+    assert t_res.json() == {"detail": "Server configuration error: ALLOWED_S3_BUCKET is not configured"}
+
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert lease_res.status_code == 500
+    assert lease_res.json() == {"detail": "Server configuration error: ALLOWED_S3_BUCKET is not configured"}
+
+    exec_res = client.post(
+        "/leases/execute",
+        json={"lease_token": "any-token"},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert exec_res.status_code == 500
+    assert exec_res.json() == {"detail": "Server configuration error: ALLOWED_S3_BUCKET is not configured"}
+
+
+def test_policy_config_empty_bucket_fails_closed(client_env, monkeypatch):
+    """Verify empty/whitespace ALLOWED_S3_BUCKET fails closed with HTTP 500."""
+    client, _ = client_env
+    task_res = _register_task(client)
+    assert task_res.status_code == 201
+    task_id = task_res.json()["task_id"]
+
+    monkeypatch.setenv("ALLOWED_S3_BUCKET", "   ")
+
+    t_res = client.post(
+        "/tasks",
+        json={"action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Admin-Key": ADMIN_KEY},
+    )
+    assert t_res.status_code == 500
+    assert t_res.json() == {"detail": "Server configuration error: ALLOWED_S3_BUCKET is not configured"}
+
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert lease_res.status_code == 500
+    assert lease_res.json() == {"detail": "Server configuration error: ALLOWED_S3_BUCKET is not configured"}
+
+
+def test_policy_config_missing_prefix_fails_closed(client_env, monkeypatch):
+    """Verify missing ALLOWED_S3_PREFIX fails closed with HTTP 500 across endpoints."""
+    client, _ = client_env
+    task_res = _register_task(client)
+    assert task_res.status_code == 201
+    task_id = task_res.json()["task_id"]
+
+    monkeypatch.delenv("ALLOWED_S3_PREFIX", raising=False)
+
+    t_res = client.post(
+        "/tasks",
+        json={"action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Admin-Key": ADMIN_KEY},
+    )
+    assert t_res.status_code == 500
+    assert t_res.json() == {"detail": "Server configuration error: ALLOWED_S3_PREFIX is not configured"}
+
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert lease_res.status_code == 500
+    assert lease_res.json() == {"detail": "Server configuration error: ALLOWED_S3_PREFIX is not configured"}
+
+    exec_res = client.post(
+        "/leases/execute",
+        json={"lease_token": "any-token"},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert exec_res.status_code == 500
+    assert exec_res.json() == {"detail": "Server configuration error: ALLOWED_S3_PREFIX is not configured"}
+
+
+def test_policy_config_empty_prefix_fails_closed(client_env, monkeypatch):
+    """Verify empty/whitespace ALLOWED_S3_PREFIX fails closed with HTTP 500."""
+    client, _ = client_env
+    monkeypatch.setenv("ALLOWED_S3_PREFIX", "   ")
+
+    task_res = client.post(
+        "/tasks",
+        json={"action": VALID_ACTION, "resource": VALID_RESOURCE},
+        headers={"X-Admin-Key": ADMIN_KEY},
+    )
+    assert task_res.status_code == 500
+    assert task_res.json() == {"detail": "Server configuration error: ALLOWED_S3_PREFIX is not configured"}
+
+
+def test_policy_config_explicitly_configured_succeeds(client_env, monkeypatch):
+    """Verify endpoints operate normally when both bucket and prefix are explicitly set."""
+    client, _ = client_env
+    custom_bucket = "custom-prod-bucket"
+    custom_prefix = "custom-prefix/"
+    custom_resource = f"s3://{custom_bucket}/{custom_prefix}data.txt"
+
+    monkeypatch.setenv("ALLOWED_S3_BUCKET", custom_bucket)
+    monkeypatch.setenv("ALLOWED_S3_PREFIX", custom_prefix)
+
+    task_res = client.post(
+        "/tasks",
+        json={"action": VALID_ACTION, "resource": custom_resource},
+        headers={"X-Admin-Key": ADMIN_KEY},
+    )
+    assert task_res.status_code == 201
+    task_id = task_res.json()["task_id"]
+
+    lease_res = client.post(
+        "/leases",
+        json={"task_id": task_id, "action": VALID_ACTION, "resource": custom_resource},
+        headers={"X-Agent-Key": AGENT_KEY},
+    )
+    assert lease_res.status_code == 201
+    assert lease_res.headers.get("Cache-Control") == "no-store"

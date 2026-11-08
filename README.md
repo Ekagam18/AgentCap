@@ -30,8 +30,8 @@ Configure environment variables before starting the broker or running tasks. You
 | `ADMIN_API_KEY` | Secret key for trusted task registration | Required |
 | `AGENT_API_KEY` | Secret key for agent lease requests and execution | Required |
 | `AGENT_ID` | Identity bound to the configured agent key | `agent-default` |
-| `ALLOWED_S3_BUCKET` | Only bucket the broker may access | `agentcap-demo` |
-| `ALLOWED_S3_PREFIX` | Only key prefix the broker may access | `reports/` |
+| `ALLOWED_S3_BUCKET` | Only bucket the broker may access | Required (e.g. `agentcap-demo`) |
+| `ALLOWED_S3_PREFIX` | Only key prefix the broker may access | Required (e.g. `reports/`) |
 | `TASK_TTL_SECONDS` | How long an approved task remains valid | `900` (default) |
 | `AWS_ROLE_ARN` | IAM role assumed per lease with a one-object session policy; see [AWS STS setup](docs/aws-sts-setup.md) | Unset (default; broker credentials used for local development) |
 | `S3_MAX_OBJECT_BYTES` | Maximum object size returned by the execution API | `1048576` (default, 1 MiB) |

@@ -69,14 +69,14 @@ This document identifies assets, defines trust boundaries, analyzes potential th
 The system comprises the following primary components:
 1. **Administrator Client**: A trusted actor using `ADMIN_API_KEY` to register approved tasks through `POST /tasks`.
 2. **AI Agent Client**: An untrusted or semi-trusted software process executing tasks. Authenticates via `X-Agent-Key` and requests authorization leases via `POST /leases`.
-3. **Authorization Broker ([`broker/main.py`](../broker/main.py))**: A FastAPI service exposing endpoints for health checks, task approval, and lease issuance.
+3. **Authorization Broker ([`broker/main.py`](../broker/main.py))**: A FastAPI service exposing endpoints for health checks, task approval, lease issuance, and authenticated single-use lease execution.
 4. **Policy Engine ([`policy/checks.py`](../policy/checks.py))**: Deterministic validation routines enforcing action whitelisting (`s3:GetObject`), S3 URI syntax rules, path traversal defenses, wildcard rejection, and exact task matching.
 5. **Database & Audit Storage ([`broker/database.py`](../broker/database.py) & [`broker/tasks.py`](../broker/tasks.py))**: An embedded SQLite database maintaining tables for `tasks`, `leases`, and `audit_events`. Uses SQLite triggers to enforce append-only audit semantics.
 6. **Isolated S3 Executor ([`broker/s3_executor.py`](../broker/s3_executor.py))**: A dedicated Python execution module that consumes a lease, re-verifies policy constraints, invokes `boto3` to fetch the approved S3 object, enforces streaming size caps, and sanitizes AWS errors.
 7. **Cloud Target (Amazon Web Services S3)**: Remote object storage housing sensitive or operational data.
 
-> [!IMPORTANT]
-> **Component Status Note:** The isolated S3 executor exists as an independently tested Python module ([`broker/s3_executor.py`](../broker/s3_executor.py)), verified by 78 automated unit tests (expanded from an initial 67-test baseline). However, **there is currently no HTTP execution endpoint** (such as `POST /execute` or `POST /leases/execute`) exposed in [`broker/main.py`](../broker/main.py). In the current prototype state, lease consumption and execution are coordinated programmatically.
+> [!NOTE]
+> **Execution Endpoint Status:** The HTTP execution endpoint `POST /leases/execute` is implemented in [`broker/main.py`](../broker/main.py), backed by [`broker/execution_service.py`](../broker/execution_service.py) and [`broker/s3_executor.py`](../broker/s3_executor.py). The endpoint atomically consumes a single-use lease and executes the authorized operation using trusted consumed-lease records from the database. The implementation is verified by automated integration and regression test suites; see Section 6.3 for architectural details.
 
 ### 2.2 Trust Boundaries
 
