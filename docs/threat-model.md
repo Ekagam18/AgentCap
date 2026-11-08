@@ -45,7 +45,7 @@ This document identifies assets, defines trust boundaries, analyzes potential th
 |   |   - Lease Management (issuance with SHA-256 token hashing)                |   |
 |   +---------------------+---------------------------------+-------------------+   |
 |                         |                                 |                       |
-|                         | Atomic SQL                      | In-memory lease dict  |
+|                         | Atomic SQL                      | SQLite lease state  |
 |                         v                                 v                       |
 |   +---------------------------------------+   +-------------------------------+   |
 |   |           SQLite Database             |   |      Isolated S3 Executor     |   |
@@ -135,7 +135,7 @@ The system comprises the following primary components:
    - Controls an agent identity (`agent-2`) but attempts to claim tasks approved for `agent-1`.
 
 ### 4.2 Explicit Non-Assumptions (Out of Scope for MVP)
-- **Host Compromise**: If an attacker achieves arbitrary code execution as the operating system user running the broker, they can read environment variables (`ADMIN_API_KEY`, AWS credentials) and modify the SQLite database file directly. OS-level containment is planned for later milestones (containers, eBPF).
+- **Host Compromise**: If an attacker achieves arbitrary code execution as the operating system user running the broker, they may read environment variables and AWS credential sources, and modify the SQLite database file directly. Process isolation and network-level egress enforcement are outside the current MVP.
 - **Physical Memory Extraction**: Cold boot attacks, memory scraping of running Python process memory, and hardware-level attacks are out of scope.
 - **AWS Service-Side Zero-Days**: Vulnerabilities in AWS S3 or AWS IAM core infrastructure are out of scope.
 
@@ -146,13 +146,14 @@ The system comprises the following primary components:
 The following matrix documents threats, their implementation status in AgentCap, and the specific mechanisms enforcing mitigation:
 
 ### Status Legend
-- **Implemented**: Fully operational in current codebase and verified by automated tests.
-- **Partially implemented**: Operational in core logic but lacking full end-to-end integration or infrastructure backing.
-- **Planned**: Designed or recommended for future milestones; not present in the current codebase.
+- **Implemented**: Operational in the current codebase and covered by automated tests.
+- **Partially implemented**: The application-level control exists, but an important deployment or isolation limitation remains.
+- **Planned**: Recommended future work that is not present in the current codebase.
+- **Residual risk / out of scope**: Not mitigated by the current MVP.
 
 | Threat ID | Threat Description | Status | Implemented Mitigation / Technical Control |
 |---|---|---|---|
-| **TH-01** | **Direct Cloud Credential Theft**<br>Agent steals static AWS access keys to perform arbitrary actions. | **Implemented** | AgentCap does not distribute AWS credentials to agents. Cloud operations are executed exclusively through the broker/executor layer. The agent receives only a short-lived, single-use application lease token. |
+| **TH-01** | **Direct Cloud Credential Theft**<br>Agent steals static AWS access keys to perform arbitrary actions. | **Partially implemented** | The broker API does not return AWS credentials, and the Python client uses application leases rather than AWS credentials in its requests. This does not prevent an agent process from using ambient credentials, shared AWS profiles, credential caches, or instance metadata if its runtime can access them; see Section 6.2. |
 | **TH-02** | **Self-Approved Privilege Escalation**<br>Agent approves its own high-privilege tasks. | **Implemented** | Strict separation of duties. Task creation (`POST /tasks`) requires `ADMIN_API_KEY`. Lease requests (`POST /leases`) accept only `AGENT_API_KEY`. Agents cannot call `/tasks` (`401 Unauthorized`). |
 | **TH-03** | **Cross-Agent Task Usurpation**<br>Agent attempts to use a task approved for another agent. | **Implemented** | Tasks are bound to an `agent_id` at creation. [`validate_task_match()`](../policy/checks.py#L75-L89) in [`policy/checks.py`](../policy/checks.py) verifies that the authenticated caller matches the task's assigned `agent_id`. Mismatches return `403 Forbidden`. |
 | **TH-04** | **Scope and Resource Substitution**<br>Agent requests an approved task ID but substitutes a malicious resource or action at lease request time. | **Implemented** | [`validate_task_match()`](../policy/checks.py#L75-L89) verifies that `action` and `resource` match the task record exactly. Furthermore, [`execute_consumed_lease()`](../broker/s3_executor.py#L248-L358) extracts `action` and `resource` from the consumed lease record itself, preventing caller tampering. |
@@ -167,8 +168,8 @@ The following matrix documents threats, their implementation status in AgentCap,
 | **TH-13** | **Information Leakage via Errors**<br>Error messages leak internal AWS paths, tokens, or IAM details. | **Implemented** | [`_sanitize_error_code()`](../broker/s3_executor.py#L239-L246) strips sensitive details from AWS `ClientError` and `BotoCoreError`, mapping them to sanitized alphanumeric codes (e.g., `S3ServiceError: AWS S3 error (NoSuchKey) during GetObject`). Tokens and hashes are excluded from error messages. |
 | **TH-14** | **Timing Attacks on API Keys**<br>Attacker measures comparison duration to deduce admin/agent keys. | **Implemented** | API key headers are verified using `hmac.compare_digest()` in [`authenticate_admin()`](../broker/main.py#L66-L78) and [`authenticate_agent()`](../broker/main.py#L80-L93) to resist timing analysis. |
 | **TH-15** | **Audit Log Tampering via SQL**<br>Attacker attempts to modify or delete historical audit entries. | **Partially implemented** | SQLite triggers `prevent_audit_update` and `prevent_audit_delete` abort any SQL `UPDATE` or `DELETE` on `audit_events`. Audit inserts occur in the same atomic transaction as lease operations. *(See Section 6 for residual risks).* |
-| **TH-16** | **Execution Auditing Gaps**<br>S3 execution attempts, successes, and failures lack audit trail. | **Planned** | Audit logging covers lease issuance and consumption, but not S3 executor outcomes. Planned for next iteration. |
-| **TH-17** | **Direct Cloud Access Bypass**<br>Agent bypasses broker completely using host AWS environment credentials or IMDS. | **Planned** | Broker-level controls cannot prevent direct outbound traffic. Planned for Evaluation 2 (eBPF network filtering and container workload isolation). |
+| **TH-16** | **Execution Audit Coverage**<br>Rejected execution attempts and S3 execution successes or failures are recorded with sanitized audit events. | **Implemented** | The broker records rejected execution attempts and S3 execution success or failure events. Audit records use sanitized metadata and exclude lease tokens, token hashes, AWS credentials, object contents, and raw exception messages. Audit-write failures fail closed. |
+| **TH-17** | **Direct Cloud Access Bypass**<br>Agent bypasses broker using ambient AWS credentials, shared profiles, credential caches, or instance metadata. | **Residual risk / out of scope** | The MVP enforces authorization at the broker API but does not isolate the agent process or prevent all direct network access. Deployment must ensure the agent cannot access broker AWS credential sources or independent cloud permissions. See Section 6.2. |
 
 ---
 
@@ -180,23 +181,44 @@ A central security distinction in AgentCap is between **application-level leases
 - This application lease **does not alter AWS IAM credentials**. The executor uses AWS IAM credentials (or STS assumed-role sessions). AWS STS role sessions have a minimum lifetime of 15 minutes (900 seconds) enforced by AWS.
 - Therefore, lease expiration in SQLite does not automatically expire the underlying AWS credential. The security guarantee relies on the broker retaining control over the execution channel.
 
-### 6.2 Lack of Network-Level Bypass Prevention (The Direct-Access Risk)
-AgentCap currently operates as an **application-layer authorization broker**:
-- It validates requests that are sent to it.
-- However, if the agent runs in an environment with ambient AWS credentials (such as environment variables `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, shared `~/.aws/credentials`, or access to the EC2 Instance Metadata Service `169.254.169.254`), a malicious or compromised agent could **bypass the broker entirely** and contact the AWS API directly.
-- **Residual Risk:** Full mitigation of the bypass threat requires operating-system and network-level enforcement (e.g., eBPF egress filtering, cgroup network namespaces, or Kubernetes network policies), which is scheduled for Evaluation 2.
+### 6.2 Lack of Process and Network-Level Isolation (Residual Risk)
 
-### 6.3 Missing Execution HTTP Endpoint Integration
-While [`broker/s3_executor.py`](../broker/s3_executor.py) is implemented and thoroughly tested as a Python library:
-- [`broker/main.py`](../broker/main.py) only exposes `GET /health`, `POST /tasks`, and `POST /leases`.
-- There is currently **no HTTP endpoint** through which an agent can submit a lease token over the network to execute the S3 operation.
-- **Residual Risk:** An end-to-end HTTP demonstration requires completing the execution endpoint in the broker API.
+AgentCap operates as an application-layer authorization broker:
 
-### 6.4 Audit Logging Coverage Gaps
-The audit subsystem in [`broker/database.py`](../broker/database.py):
-- Successfully captures `lease_issued` and `lease_consumed` events atomically with their respective database operations.
-- However, it **does not yet capture S3 execution outcomes** (`s3_execution_attempted`, `s3_execution_succeeded`, `s3_execution_failed`).
-- If an S3 operation fails due to network partition or AWS access denial, the lease remains recorded as `consumed`, but no corresponding cloud failure event is logged in `audit_events`.
+- The broker validates requests and does not return AWS credentials in its API responses.
+- The Python agent client communicates with the broker and does not need to call AWS directly to perform the approved operation.
+- However, if the agent process can access ambient AWS credentials, shared `~/.aws` configuration, AWS login or SSO credential caches, environment-based credentials, or the EC2 Instance Metadata Service (`169.254.169.254`), a compromised agent may contact AWS independently of the broker.
+- **Development-demo limitation:** The live local demonstration launched the broker and Python agent from the same PowerShell session. That session contained `AWS_PROFILE=agentcap-broker`, so the agent process inherited the variable. The demonstration verifies the broker-mediated workflow, but it does not prove isolation from AWS credential sources.
+- **Residual Risk:** A deployment must run the agent under a separate operating-system identity or runtime that cannot read the broker's AWS environment, profiles, or credential caches. Platform-level controls must also restrict direct cloud access where required. These isolation controls are outside the current MVP.
+
+### 6.3 HTTP Execution Endpoint and Agent Client
+
+The HTTP execution path is implemented:
+
+- `POST /leases/execute` accepts a lease token and requires the agent authentication header.
+- The broker consumes the lease exactly once, uses the trusted consumed-lease record, rechecks policy, and executes the approved S3 operation.
+- The endpoint returns object bytes encoded as Base64 together with content metadata. The response is subject to `S3_MAX_OBJECT_BYTES` (default 1 MiB).
+- [`agent/client.py`](../agent/client.py) requests the lease and submits it for execution. It validates the response, strictly decodes Base64, checks the reported content length and configured size limit, and does not expose the lease token in its result representation.
+- [`agent/__main__.py`](../agent/__main__.py) provides the `python -m agent` command-line interface. Output files are created exclusively rather than overwritten.
+
+The lease remains consumed if S3 or STS execution fails. Automated tests cover successful execution, invalid and expired leases, replay attempts, authentication failures, oversized objects, and sanitized AWS errors.
+
+### 6.4 Audit Logging Coverage
+
+The audit subsystem records the task and execution lifecycle, including:
+
+- Task registration.
+- Lease issuance and denied lease requests.
+- Successful lease consumption.
+- Rejected execution attempts.
+- Successful S3 execution.
+- Failed S3 execution.
+
+Audit records contain sanitized metadata. Lease tokens, token hashes, AWS credentials, object contents, and raw exception messages are excluded. Required audit writes fail closed: an operation is not reported as successful if its required audit write fails.
+
+The live development demonstration verified four successful events for one task: `task_registered`, `lease_issued`, `lease_consumed`, and `s3_execution_succeeded`.
+
+SQLite triggers prevent updates and deletes through normal SQL statements, but this does not make the database cryptographically tamper-proof. See Section 6.5.
 
 ### 6.5 Database Integrity Limitations
 Although SQLite triggers prevent SQL-level modification or deletion of rows:
@@ -213,60 +235,38 @@ Currently, `AGENT_API_KEY` is a single environment variable bound to a single `A
 
 ## 7. Recommended Next Steps
 
-The following improvements are prioritized for upcoming milestones:
+The current MVP implements the administrator-approved task flow, single-use leases, broker-mediated S3 execution, and structured audit events. The following are deployment-hardening recommendations rather than claims of existing MVP functionality:
 
-### Priority 1: High (Immediate MVP Completion)
-1. **Expose S3 Execution Endpoint in Broker**:
-   - Add `POST /leases/execute` (or `POST /s3/execute`) to [`broker/main.py`](../broker/main.py).
-   - Accept the lease token, invoke `consume_lease()`, pass the resulting record to `execute_consumed_lease()`, and return the structured object payload or download stream.
-2. **Extend Audit Logging to S3 Execution**:
-   - Add audit event recording for `s3_execution_attempted`, `s3_execution_succeeded`, and `s3_execution_failed`.
-   - Record sanitized AWS error codes, object content length, and latency.
-3. **End-to-End Workflow Integration Tests**:
-   - Add integration tests verifying the full HTTP lifecycle: Admin registers task -> Agent requests lease -> Agent invokes execution endpoint -> Object received -> Audit log verified.
+1. **Separate agent and broker identities:** Run the agent under an operating-system identity or runtime that cannot read the broker's AWS environment variables, AWS configuration, credential files, or login caches.
+2. **Restrict cloud access from the agent runtime:** Where required, enforce platform and network controls so the agent can reach the broker without independently reaching cloud APIs or metadata services.
+3. **Protect API keys:** Use a secure secret-management process, separate administrator and agent credentials, and define a rotation procedure.
+4. **Protect the broker transport:** Use HTTPS for non-local deployments and restrict access to the broker API to authorized callers.
+5. **Improve audit durability:** Protect database filesystem permissions, establish backup and retention procedures, and consider exporting audit events to a separately controlled system.
+6. **Review production IAM configuration:** Keep the broker's role-assumption permissions and executor role policy limited to the intended S3 resources. Revalidate the policy before deployment.
 
-### Priority 2: Medium (Evaluation 1 Hardening)
-4. **Least-Privilege AWS IAM Configuration**:
-   - Document and template the exact IAM policy required for the broker's cloud identity, restricting AWS permissions solely to `s3:GetObject` on `arn:aws:s3:::<allowed-bucket>/<allowed-prefix>/*`.
-5. **Payload Streaming in HTTP Endpoint**:
-   - Ensure the new execution endpoint streams large payloads using FastAPI `StreamingResponse` rather than loading entire multi-megabyte files into memory at the HTTP layer.
-
-### Priority 3: Architecture & Evaluation 2 (Long-term Containment)
-6. **Network & eBPF-Based Enforcement**:
-   - Implement eBPF socket filtering or container network policies to block outbound TCP port 443 connections from the agent container to AWS endpoints (`*.amazonaws.com`), ensuring the agent cannot bypass the broker.
-7. **Workload Identity & Dynamic Tokens**:
-   - Transition from static `AGENT_API_KEY` environment variables to dynamic workload identity (e.g., Kubernetes ServiceAccount tokens or SPIFFE/SPIRE).
-
----
+These recommendations do not change the current MVP scope. The current threat model does not claim operating-system or network-level containment of a compromised agent.
 
 ## 8. Security Validation & Test Evidence
 
 The security controls detailed in this threat model are validated through automated regression test suites.
 
 ### 8.1 Automated Test Suite Summary
-Execution of the complete local test suite across the repository produces **136 passed tests** (0 failed, 1 Starlette deprecation warning), expanded from an earlier 125-test baseline:
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest -v
-```
+The complete local automated test suite was run on 2026-11-08 and completed with **337 passed tests, 0 failures, and 1 deprecation warning**.
 
-```text
-============================= test session starts =============================
-platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.7.0
-rootdir: D:\5th Sem Cse 2026\Grp_project\AgentCap
-configfile: pytest.ini
-plugins: anyio-4.15.1
-collected 136 items
+Run the suite with:
 
-tests/test_broker.py (15 tests) ............... PASSED
-tests/test_leases.py (29 tests) ............................. PASSED
-tests/test_policy.py (14 tests) .............. PASSED
-tests/test_s3_executor.py (78 tests) .................................... PASSED
+`.\.venv\Scripts\python.exe -m pytest -v`
 
-======================= 136 passed, 1 warning in 1.84s ========================
-```
+The warning is a Starlette deprecation warning indicating that using `httpx` with `starlette.testclient` is deprecated and recommending `httpx2`. It did not cause test failures.
 
-*(Historical baseline prior to S3 executor edge-case test expansion: 125 total tests, including 67 S3 executor tests).*
+The suite covers broker authentication and task handling, lease lifecycle and concurrency, policy validation, S3 execution and error handling, and Python agent client behavior.
+
+Dependency validation also completed successfully with:
+
+`.\.venv\Scripts\python.exe -m pip check`
+
+Result: `No broken requirements found.`
 
 ### 8.2 Security Properties Verified by Tests
 
@@ -305,3 +305,10 @@ tests/test_s3_executor.py (78 tests) .................................... PASSED
    - Stream response body closed reliably under all circumstances (success, exception, size violation).
    - AWS errors (`ClientError`, `BotoCoreError`) sanitized to avoid credential or environment leakage.
    - No tokens, hashes, or secret keys present in execution results or error strings.
+
+5. **Python Agent Client (`tests/test_agent_client.py`)**:
+   - Agent API key attached to broker requests.
+   - Successful response Base64 decoding and content metadata validation.
+   - Lease token not exposed in the result representation.
+   - HTTP errors sanitized.
+   - Invalid Base64, mismatched content length, and oversized responses rejected.
